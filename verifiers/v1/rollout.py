@@ -19,6 +19,7 @@ from verifiers.v1.errors import (
     ToolsetError,
     boundary,
 )
+from verifiers.v1.grading import grade_task, verifier_runtime
 from verifiers.v1.harness import Harness, HarnessSession
 from verifiers.v1.interception import Interception, serve_interception
 from verifiers.v1.mcp import SharedToolServer, serve_tools
@@ -28,6 +29,7 @@ from verifiers.v1.runtimes import (
     RuntimeHandle,
     make_runtime,
 )
+from verifiers.v1.runtimes.deployment import TargetLost, Termination
 from verifiers.v1.session import RolloutLimits, RolloutSession, hook_boundary
 from verifiers.v1.state import state_cls
 from verifiers.v1.task import Task
@@ -98,6 +100,7 @@ class Rollout:
         harness: Harness,
         ctx: ModelContext,
         runtime_config: RuntimeConfig,
+        task_runtime_config: RuntimeConfig | None = None,
         has_user: bool = False,
         timeouts: RolloutTimeouts,
         limits: RolloutLimits,
@@ -111,6 +114,16 @@ class Rollout:
         self.harness = harness
         self.ctx = ctx
         self.runtime_config = runtime_config
+        self._verifier_policy = agent_config.verifier
+        self._grading_config = None
+        self._scoring_task = task
+        self._grader = None
+        self.task_runtime_config = task_runtime_config
+        self.harness_handle: RuntimeHandle | None = None
+        self.deployment = None
+        self._deployment_config = agent_config.deployment
+        self._failure_policy = agent_config.execution_failure
+        self._terminal_execution = False
         self._has_user = has_user
         self._timeouts = timeouts
         self._agent_time_remaining = self._timeouts.agent
@@ -138,15 +151,16 @@ class Rollout:
             for fn in discover_decorated(task, "intercept")
         ]
         stops = [(hook_boundary(fn, allow_trace=True), fn) for fn in task.hooks("stop")]
+        execution_policy = task_runtime_config or runtime_config
         self._session = RolloutSession(
             ctx=ctx,
             trace=self.trace,
             network_policy=(
                 NetworkPolicyConfig(allow=[])
-                if isinstance(runtime_config, ModalConfig)
-                and not runtime_config.network_access
-                else runtime_config
-                if isinstance(runtime_config, NetworkPolicyConfig)
+                if isinstance(execution_policy, ModalConfig)
+                and not execution_policy.network_access
+                else execution_policy
+                if isinstance(execution_policy, NetworkPolicyConfig)
                 else NetworkPolicyConfig()
             ),
             trace_stops=[fn for boundary, fn in stops if boundary is Trace],
@@ -262,9 +276,43 @@ class Rollout:
                     "task.prompt, or drive the run through agent.interaction() and open "
                     "it with the first turn(message)"
                 )
-            if self._borrowed_handle is None:
-                await handle.runtime.start()
+            self.deployment = handle.runtime.deploy(
+                spec=self.task.deployment_spec(),
+                execution=self.task_runtime_config,
+                env=runtime_env,
+                config=self._deployment_config,
+                borrowed=self._borrowed_handle,
+            )
+            async with asyncio.timeout(self._timeouts.setup) as setup_timeout:
+                await self.deployment.start()
+            handle = self.handle = self.deployment.workspace
+            self.harness_handle = (
+                self.deployment.harness.handle() if self.deployment.split else handle
+            )
             self.trace.agent.runtime = handle.info.model_copy()
+            if self.deployment.split:
+                self.trace.agent.harness_runtime = self.harness_handle.info.model_copy()
+            if not self.task.scoring_deferred:
+                mode = self._verifier_policy.mode
+                isolated = (
+                    self.task.data.verifier_mode if mode == "task" else mode
+                ) == "isolated"
+                self._scoring_task = self.task.grading_task(handle, isolated=isolated)
+                if isolated:
+                    self._grader = self._scoring_task
+                    self._grading_config = verifier_runtime(
+                        self._grader,
+                        handle,
+                        self.deployment.strategy.verifier_config(self.deployment),
+                        self._verifier_policy,
+                    )
+                elif (
+                    self._verifier_policy.runtime is not None
+                    or self._verifier_policy.env is not None
+                ):
+                    raise TaskError(
+                        "verifier runtime/env overrides require isolated verification"
+                    )
             await handle.runtime.prepare_setup()
             now = time.time()
             self.trace.timing.boot.end = now
@@ -280,18 +328,37 @@ class Rollout:
                 asyncio.timeout_at(setup_deadline) as setup_timeout,
                 boundary(TaskError, "task setup"),
             ):
-                await invoke(self.task.setup, {"trace": self.trace, "runtime": handle})
+                await invoke(
+                    self.task.setup,
+                    {
+                        "trace": self.trace,
+                        "runtime": handle,
+                        "deployment": self.deployment,
+                    },
+                )
             async with (
                 asyncio.timeout_at(setup_deadline) as setup_timeout,
                 boundary(HarnessError, "harness setup"),
             ):
-                # The harness, its colocated tools, and its session run as the task's
-                # `agent_user` (just `handle` when unset). Task setup and scoring,
-                # interception, and the execution policy keep the default handle.
                 self._agent_handle = await resolve_agent_handle(
                     handle, self.task.data.agent_user
                 )
-                await self.harness.setup(self._agent_handle)
+                harness_handle = (
+                    self.harness_handle if self.deployment.split else self._agent_handle
+                )
+                await self.harness.setup(harness_handle)
+                if self.deployment.split:
+                    connection = await self.deployment.connection(
+                        harness_handle, self._agent_handle
+                    )
+                    await invoke(
+                        self.harness.setup_execution,
+                        {
+                            "runtime": harness_handle,
+                            "task_runtime": self._agent_handle,
+                            "connection": connection,
+                        },
+                    )
             async with boundary(ToolsetError, "building tool servers"):
                 toolsets = self.task.toolsets(self.task.config)
             # `base_url` is the interception server's reachable URL for this rollout.
@@ -305,13 +372,13 @@ class Rollout:
             ) = await self._stack.enter_async_context(
                 serve_interception(
                     self._interception,
-                    handle,
+                    self.harness_handle,
                     self._session,
                     toolsets,
                     self._shared_tools,
                 )
             )
-            self._endpoint = handle.host_url(f"{base_url.rstrip('/')}/v1")
+            self._endpoint = self.harness_handle.host_url(f"{base_url.rstrip('/')}/v1")
             self._secret = model_secret
             self._urls = await self._stack.enter_async_context(
                 serve_tools(
@@ -325,7 +392,7 @@ class Rollout:
             )
             # Setup and service provisioning are complete. Apply the runtime's
             # execution policy while preserving the framework routes the agent uses.
-            await handle.runtime.prepare_execution(
+            await self.deployment.prepare_execution(
                 [self._endpoint, *self._urls.values()]
             )
             async with (
@@ -415,7 +482,7 @@ class Rollout:
                 if not self._session.stopped:
                     session_kwargs = (
                         {
-                            "tool_interception_url": handle.host_url(
+                            "tool_interception_url": self.harness_handle.host_url(
                                 f"{base_url.rstrip('/')}/tool"
                             )
                         }
@@ -429,7 +496,9 @@ class Rollout:
                     self._harness_session = await self.harness.session(
                         self.ctx,
                         self.trace,
-                        self._agent_handle,
+                        self.harness_handle
+                        if self.deployment.split
+                        else self._agent_handle,
                         self._endpoint,
                         self._secret,
                         self._urls,
@@ -505,13 +574,20 @@ class Rollout:
                     if self._session.stopped:
                         return False
                 self._session.on_turn_input = on_input
-                await self._harness_session.turn(messages)
+                assert self.deployment is not None
+                await self.deployment.run(self._harness_session.turn(messages))
+        except TargetLost as error:
+            self.execution_terminated(error)
+            return False
         except TimeoutError as e:
             # An expired rollout deadline is the agent breaking its time budget: a
             # timeout stop. A TimeoutError from the harness's own I/O with no
             # expired deadline stays the raw failure.
             if self.deadline_at is not None and (loop.time() >= self.deadline_at):
-                self.timeout("agent")
+                if self._failure_policy.agent_timeout == "grade":
+                    self.timeout("agent")
+                else:
+                    self.execution_terminated(None)
             else:
                 self.fail(e)
             return False
@@ -543,6 +619,37 @@ class Rollout:
         # never moved, forever.
         return self.ok and trace.num_turns > turns_before
 
+    def execution_terminated(self, error: TargetLost | None) -> None:
+        if self._terminal_execution or self._failed:
+            return
+        policy = (
+            self._failure_policy.workspace_loss
+            if error
+            else self._failure_policy.agent_timeout
+        )
+        if error is not None and error.status.attribution == "infra":
+            policy = "error"
+        self.trace.termination = Termination(
+            kind="target_lost" if error else "timeout",
+            target=self.deployment.execution_name if self.deployment else "main",
+            attribution=error.status.attribution if error else "unknown",
+            cause=error.status.cause if error else "agent_deadline",
+            evidence=error.status.evidence or {} if error else {},
+            policy=policy,
+            valid_sample=policy == "zero",
+            reward=0 if policy == "zero" else None,
+        )
+        self._terminal_execution = True
+        if error is None:
+            self.trace.is_timeout = True
+        self.trace.stop("execution_failed", override=True)
+        self._session.release()
+        if policy == "zero":
+            self.trace.rewards.clear()
+            self.trace.record_reward("execution_failure", 0.0)
+        else:
+            self.fail(error or SandboxError("agent execution deadline exceeded"))
+
     async def abort(self) -> None:
         """Free everything this run holds — the entered servers and an owned
         runtime — without finalizing or scoring: the escape path when an exception
@@ -556,10 +663,12 @@ class Rollout:
             await self._stack.aclose()
         if self.handle is not None:
             with contextlib.suppress(Exception):
-                await self.harness.cleanup(self.trace, self.handle)
-        if self._borrowed_handle is None and self.handle is not None:
+                await self.harness.cleanup(
+                    self.trace, self.harness_handle or self.handle
+                )
+        if self.deployment is not None:
             with contextlib.suppress(Exception):
-                await self.handle.runtime.stop()
+                await self.deployment.close()
 
     async def close(self) -> Trace:
         """Finish the rollout: tool servers and interception down, task `finalize`
@@ -576,6 +685,14 @@ class Rollout:
                 try:
                     await self._harness_session.close()
                 except Exception:
+                    if (
+                        not self._terminal_execution
+                        and self.deployment is not None
+                        and self.deployment.split
+                    ):
+                        status = await self.deployment.status()
+                        if status.state == "lost":
+                            self.execution_terminated(TargetLost(status))
                     # Generation already completed. A transport teardown failure
                     # must not discard its otherwise scoreable trajectory.
                     logger.warning(
@@ -589,8 +706,19 @@ class Rollout:
                 if trace.timing.agent.start and not trace.timing.agent.end:
                     trace.timing.agent.end = time.time()
                 trace.notify()
-            if not self._failed and self._opened:
+            if (
+                not self._failed
+                and not self._terminal_execution
+                and self.deployment is not None
+            ):
+                status = await self.deployment.status()
+                if status.state == "lost":
+                    self.execution_terminated(TargetLost(status))
+            if not self._failed and not self._terminal_execution and self._opened:
                 assert handle is not None
+                assert self.deployment is not None
+                await self.deployment.quiesce()
+                grader = self._grader
                 trace.timing.finalize.start = time.time()
                 try:
                     async with (
@@ -598,14 +726,30 @@ class Rollout:
                         boundary(TaskError, "task finalize"),
                     ):
                         await invoke(
-                            self.task.finalize, {"trace": trace, "runtime": handle}
+                            self.task.finalize,
+                            {
+                                "trace": trace,
+                                "runtime": handle,
+                                "deployment": self.deployment,
+                            },
                         )
-                        if self._collect_artifacts and not trace.state.artifacts:
+                        if (
+                            self._collect_artifacts or grader is not None
+                        ) and not trace.state.artifacts:
                             trace.state.artifacts = await collect(
                                 handle,
                                 self.task.data.artifacts,
                                 max_bytes=self.task.data.artifact_max_bytes,
                             )
+                        if grader is not None:
+                            await self.deployment.stop_execution()
+                        await self.task.finalize_services(
+                            trace,
+                            {
+                                name: self.deployment.target(name)
+                                for name in self.deployment.targets
+                            },
+                        )
                 except TimeoutError:
                     self.timeout("finalize")
                 now = time.time()
@@ -614,14 +758,39 @@ class Rollout:
                 trace.notify()
                 try:
                     async with (
-                        asyncio.timeout(self._timeouts.scoring),
+                        asyncio.timeout(
+                            None if grader is not None else self._timeouts.scoring
+                        ),
                         boundary(TaskError, "scoring"),
                     ):
                         # Cross-trace judgement runs later, after the runtime is gone.
-                        await asyncio.gather(
-                            self.task.score(trace, handle),
-                            self.harness.score(trace, self._agent_handle or handle),
-                        )
+                        if grader is not None:
+                            await grade_task(
+                                grader,
+                                trace,
+                                self._grading_config,
+                                self._timeouts,
+                                self._verifier_policy,
+                                self.deployment,
+                            )
+                        else:
+                            if not self._scoring_task.scoring_deferred:
+                                await invoke(
+                                    self._scoring_task.stage_verifier,
+                                    {"trace": trace, "runtime": handle},
+                                )
+                            await self._scoring_task.score(
+                                trace, handle, self.deployment
+                            )
+                        async with asyncio.timeout(
+                            self._timeouts.scoring if grader is not None else None
+                        ):
+                            await self.harness.score(
+                                trace,
+                                self.harness_handle
+                                if self.deployment.split
+                                else self._agent_handle,
+                            )
                 except TimeoutError:
                     self.timeout("scoring")
                 trace.timing.scoring.end = time.time()
@@ -649,7 +818,7 @@ class Rollout:
             trace.split_agent_time()
             if handle is not None:
                 try:
-                    await self.harness.cleanup(trace, handle)
+                    await self.harness.cleanup(trace, self.harness_handle or handle)
                 except Exception:
                     logger.warning(
                         "harness cleanup failed (rollout %s)", trace.id, exc_info=True
@@ -657,13 +826,11 @@ class Rollout:
             # Tear down here — the env's `score()` (later) needs only the traces,
             # not a live runtime. A borrowed runtime is its creator's to tear down,
             # not this rollout's.
-            if self._borrowed_handle is None and handle is not None:
+            if self.deployment is not None:
                 try:
-                    await handle.runtime.stop()
+                    await self.deployment.close()
                 except Exception:
-                    logger.warning(
-                        "runtime teardown failed (rollout %s)", trace.id, exc_info=True
-                    )
+                    logger.warning("deployment teardown failed", exc_info=True)
         logger.info(
             "rollout done: id=%s task=%s reward=%.3f turns=%d stop=%s",
             trace.id,
